@@ -1,0 +1,25 @@
+{
+  "name": "fl-acestep-training",
+  "version": "1.1.0",
+  "description": "FL AceStep Training - LoRA Training nodes for ACE-Step 1.5 in ComfyUI",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "watch": "vite build --watch",
+    "dev": "vite build --mode development --watch"
+  },
+  "devDependencies": {
+    "@comfyorg/comfyui-frontend-types": "^1.0.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.0"
+  },
+  "keywords": [
+    "comfyui",
+    "ace-step",
+    "music-generation",
+    "lora",
+    "training"
+  ],
+  "author": "",
+  "license": "MIT"
+}
