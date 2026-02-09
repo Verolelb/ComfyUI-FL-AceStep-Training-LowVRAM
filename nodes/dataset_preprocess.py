@@ -5,23 +5,11 @@ Converts labeled samples to tensor files for training.
 Uses native ComfyUI MODEL type for the ACE-Step model.
 """
 
-import os
 import json
-import math
 import logging
 from pathlib import Path
-from typing import List
 
 import torch
-import torchaudio
-
-# Try to use soundfile for audio loading (more compatible than torchcodec)
-try:
-    import soundfile as sf
-    SOUNDFILE_AVAILABLE = True
-except ImportError:
-    sf = None
-    SOUNDFILE_AVAILABLE = False
 
 try:
     from comfy.utils import ProgressBar
@@ -32,11 +20,9 @@ from ..modules.acestep_model import (
     is_acestep_model,
     get_silence_latent,
 )
+from ..modules.audio_utils import load_audio, vae_encode
 
 logger = logging.getLogger("FL_AceStep_Training")
-
-# Log audio backend availability at import time
-logger.info(f"Soundfile available: {SOUNDFILE_AVAILABLE}")
 
 # SFT generation prompt template (from ACE-Step constants)
 SFT_GEN_PROMPT = """# Instruction
@@ -50,11 +36,6 @@ SFT_GEN_PROMPT = """# Instruction
 """
 
 DEFAULT_DIT_INSTRUCTION = "Fill the audio semantic mask based on the given conditions:"
-
-# Constants for tiled VAE encoding
-SAMPLE_RATE = 48000
-VAE_CHUNK_SIZE = SAMPLE_RATE * 30  # 30 seconds
-VAE_OVERLAP = SAMPLE_RATE * 2  # 2 seconds overlap
 
 
 def encode_text_with_clip(clip, text: str, device, dtype):
@@ -128,134 +109,6 @@ def encode_text_with_clip(clip, text: str, device, dtype):
         "Could not encode text with CLIP. The CLIP object doesn't have a compatible API. "
         "Please use the ACE-Step CLIP Loader node instead of the native checkpoint loader."
     )
-
-
-def tiled_vae_encode(vae, audio_tensor: torch.Tensor, device, dtype) -> torch.Tensor:
-    """
-    Encode audio to latent space using tiled encoding for long audio.
-
-    The VAE (AutoencoderOobleck) cannot process very long audio in one pass.
-    For audio longer than ~30 seconds, we use tiled encoding with overlap
-    to avoid boundary artifacts.
-
-    Args:
-        vae: ComfyUI VAE object (has first_stage_model attribute)
-        audio_tensor: Audio tensor [B, 2, T] at 48kHz (stereo)
-        device: Device to use
-        dtype: Data type to use (may be overridden by VAE's actual dtype)
-
-    Returns:
-        latents: Latent tensor [B, T_latent, 64]
-    """
-    print(f"[ACEStep] tiled_vae_encode() called with shape {audio_tensor.shape}")
-    logger.info(f"[ACEStep] tiled_vae_encode() called with shape {audio_tensor.shape}")
-
-    # Get the actual VAE model from ComfyUI's wrapper
-    # ComfyUI VAE has first_stage_model which is the actual model
-    if hasattr(vae, 'first_stage_model'):
-        vae_model = vae.first_stage_model
-    else:
-        vae_model = vae
-
-    # Get VAE's actual dtype from its parameters to avoid dtype mismatch
-    # The VAE from checkpoint may be float16 while we default to bfloat16
-    try:
-        vae_dtype = next(vae_model.parameters()).dtype
-        vae_device = next(vae_model.parameters()).device
-        logger.info(f"[ACEStep] VAE dtype from model: {vae_dtype}, device: {vae_device}")
-    except StopIteration:
-        # Fallback if VAE has no parameters (shouldn't happen)
-        vae_dtype = dtype
-        vae_device = device
-        logger.warning(f"[ACEStep] Could not detect VAE dtype, using default: {vae_dtype}")
-
-    # Move VAE to GPU if it's on CPU (CPU encoding is extremely slow)
-    target_device = torch.device('cuda') if torch.cuda.is_available() else vae_device
-    if vae_device != target_device:
-        logger.info(f"[ACEStep] Moving VAE from {vae_device} to {target_device} for faster encoding")
-        vae_model = vae_model.to(target_device)
-        vae_device = target_device
-
-    with torch.no_grad():
-        # Use VAE's actual dtype to avoid mismatch errors
-        audio = audio_tensor.to(vae_device).to(vae_dtype)
-        B, C, S = audio.shape
-
-        # Short audio - encode directly (no tiling needed)
-        if S <= VAE_CHUNK_SIZE:
-            logger.info(f"[ACEStep] Short audio ({S / SAMPLE_RATE:.1f}s), encoding directly")
-            latent_dist = vae_model.encode(audio)
-            # Handle different VAE output formats
-            if hasattr(latent_dist, 'latent_dist'):
-                latents = latent_dist.latent_dist.sample()
-            elif hasattr(latent_dist, 'sample'):
-                latents = latent_dist.sample()
-            else:
-                latents = latent_dist
-            # Transpose from [B, 64, T] to [B, T, 64] for training
-            return latents.transpose(1, 2)
-
-        # Long audio - use tiled encoding with overlap-discard strategy
-        logger.info(f"[ACEStep] Using tiled VAE encoding for long audio ({S / SAMPLE_RATE:.1f}s)")
-        print(f"[ACEStep] Using tiled VAE encoding for long audio ({S / SAMPLE_RATE:.1f}s)")
-
-        stride = VAE_CHUNK_SIZE - 2 * VAE_OVERLAP  # Core size (non-overlapping part)
-        num_steps = math.ceil(S / stride)
-
-        logger.info(f"[ACEStep] Will process {num_steps} chunks with stride {stride}")
-
-        encoded_latent_list: List[torch.Tensor] = []
-        downsample_factor = None
-
-        for i in range(num_steps):
-            # Calculate core region (non-overlapping part we want to keep)
-            core_start = i * stride
-            core_end = min(core_start + stride, S)
-
-            # Calculate window region (core + overlap on both sides)
-            win_start = max(0, core_start - VAE_OVERLAP)
-            win_end = min(S, core_end + VAE_OVERLAP)
-
-            # Extract and encode chunk
-            audio_chunk = audio[:, :, win_start:win_end]
-
-            logger.info(f"[ACEStep] Encoding chunk {i+1}/{num_steps}: samples [{win_start}:{win_end}]")
-
-            latent_dist = vae_model.encode(audio_chunk)
-            # Handle different VAE output formats
-            if hasattr(latent_dist, 'latent_dist'):
-                latent_chunk = latent_dist.latent_dist.sample()
-            elif hasattr(latent_dist, 'sample'):
-                latent_chunk = latent_dist.sample()
-            else:
-                latent_chunk = latent_dist
-
-            # Get downsample factor from first chunk
-            if downsample_factor is None:
-                downsample_factor = audio_chunk.shape[-1] / latent_chunk.shape[-1]
-                logger.info(f"[ACEStep] VAE downsample factor: {downsample_factor:.2f}")
-
-            # Calculate trim amounts in latent frames
-            # We need to trim the overlap regions to get just the core
-            trim_start = int(round((core_start - win_start) / downsample_factor))
-            added_end = win_end - core_end
-            trim_end = int(round(added_end / downsample_factor))
-
-            # Extract core latent (discard overlap regions)
-            end_idx = latent_chunk.shape[-1] - trim_end if trim_end > 0 else latent_chunk.shape[-1]
-            latent_core = latent_chunk[:, :, trim_start:end_idx]
-            encoded_latent_list.append(latent_core)
-
-            logger.debug(f"[ACEStep] Chunk {i+1}/{num_steps}: latent core shape {latent_core.shape}")
-
-        # Concatenate all core latents along time dimension
-        final_latents = torch.cat(encoded_latent_list, dim=-1)  # [B, 64, T_total]
-
-        logger.info(f"[ACEStep] Tiled encoding complete: {len(encoded_latent_list)} chunks -> latent shape {final_latents.shape}")
-        print(f"[ACEStep] Tiled encoding complete: {len(encoded_latent_list)} chunks -> latent shape {final_latents.shape}")
-
-        # Transpose from [B, 64, T] to [B, T, 64] for training
-        return final_latents.transpose(1, 2)
 
 
 class FL_AceStep_PreprocessDataset:
@@ -456,42 +309,8 @@ class FL_AceStep_PreprocessDataset:
         dtype,
     ):
         """Preprocess a single sample to tensor data."""
-        # Load audio - use soundfile directly to avoid torchaudio's torchcodec dependency
-        if SOUNDFILE_AVAILABLE:
-            # Load with soundfile and convert to torch tensor
-            data, sr = sf.read(sample.audio_path, dtype='float32')
-            # soundfile returns (samples, channels) for stereo, we need (channels, samples)
-            if len(data.shape) == 1:
-                # Mono: add channel dimension
-                waveform = torch.from_numpy(data).unsqueeze(0)
-            else:
-                # Stereo/multi-channel: transpose to (channels, samples)
-                waveform = torch.from_numpy(data.T)
-        else:
-            # Fallback to torchaudio (may fail without torchcodec)
-            waveform, sr = torchaudio.load(sample.audio_path)
-
-        # Resample to 48kHz
-        if sr != 48000:
-            resampler = torchaudio.transforms.Resample(sr, 48000)
-            waveform = resampler(waveform)
-
-        # Check minimum duration - VAE requires at least ~0.5 seconds at 48kHz
-        # The VAE has convolutional layers with kernel size 7 that need sufficient input
-        MIN_SAMPLES = 48000  # 1 second minimum at 48kHz
-        if waveform.shape[1] < MIN_SAMPLES:
-            raise ValueError(f"Audio too short: {waveform.shape[1]} samples ({waveform.shape[1]/48000:.2f}s). Minimum is 1 second.")
-
-        # Convert to stereo
-        if waveform.shape[0] == 1:
-            waveform = waveform.repeat(2, 1)
-        elif waveform.shape[0] > 2:
-            waveform = waveform[:2, :]
-
-        # Truncate to max duration
-        max_samples = int(max_duration * 48000)
-        if waveform.shape[1] > max_samples:
-            waveform = waveform[:, :max_samples]
+        # Load audio using shared utility (resamples to 48kHz stereo)
+        waveform, sr = load_audio(sample.audio_path, max_duration=max_duration)
 
         # Add batch dimension
         waveform = waveform.unsqueeze(0)
@@ -500,7 +319,7 @@ class FL_AceStep_PreprocessDataset:
         logger.info(f"Waveform shape before VAE: {waveform.shape}, dtype: {waveform.dtype}")
 
         # Encode to VAE latents using tiled encoding for long audio
-        target_latents = tiled_vae_encode(vae, waveform, device, dtype)  # [1, T, 64]
+        target_latents = vae_encode(vae, waveform)  # [1, T, 64]
 
         logger.info(f"VAE latents shape: {target_latents.shape}")
         latent_length = target_latents.shape[1]

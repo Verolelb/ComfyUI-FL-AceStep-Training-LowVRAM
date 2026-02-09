@@ -14,9 +14,9 @@ except ImportError:
 
 from ..modules.acestep_model import (
     is_acestep_model,
-    get_acestep_dit,
     get_acestep_tokenizer,
 )
+from ..modules.audio_utils import audio_to_codes
 
 logger = logging.getLogger("FL_AceStep_Training")
 
@@ -37,7 +37,8 @@ class FL_AceStep_LabelSamples:
 
     Requires:
     - dataset: Dataset from Scan Directory node
-    - model: ACE-Step MODEL (purple connection) for audio encoding
+    - model: ACE-Step MODEL (purple connection) for audio tokenization
+    - vae: ACE-Step VAE (red connection) for audio encoding
     - llm: LLM model for metadata generation
     """
 
@@ -47,6 +48,7 @@ class FL_AceStep_LabelSamples:
             "required": {
                 "dataset": ("ACESTEP_DATASET",),
                 "model": ("MODEL",),  # Native ComfyUI MODEL type (purple connection)
+                "vae": ("VAE",),  # Native ComfyUI VAE type (red connection)
                 "llm": ("ACESTEP_LLM",),
             },
             "optional": {
@@ -78,6 +80,7 @@ class FL_AceStep_LabelSamples:
         self,
         dataset,
         model,  # ComfyUI MODEL (ModelPatcher)
+        vae,  # ComfyUI VAE
         llm,
         skip_metas=False,
         only_unlabeled=False,
@@ -91,9 +94,20 @@ class FL_AceStep_LabelSamples:
         if not is_acestep_model(model):
             return (dataset, 0, "Error: Model is not an ACE-Step model")
 
-        # Get the DiT and tokenizer from the MODEL
-        dit = get_acestep_dit(model)
+        # Get the tokenizer from the MODEL for audio-to-codes conversion
         tokenizer = get_acestep_tokenizer(model)
+
+        # Move tokenizer to GPU once before the loop to avoid per-sample overhead
+        import torch
+        target_device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        tokenizer_device = next(tokenizer.parameters()).device
+        if tokenizer_device.type != target_device.type:
+            logger.info(f"Moving audio tokenizer from {tokenizer_device} to {target_device}")
+            tokenizer.to(target_device)
+
+        # device/dtype for audio_to_codes (tokenizer location)
+        device = target_device
+        dtype = next(tokenizer.parameters()).dtype
 
         samples = dataset.samples
         if not samples:
@@ -117,44 +131,51 @@ class FL_AceStep_LabelSamples:
 
         for idx, sample in samples_to_label:
             try:
-                # Convert audio to codes using the tokenizer
-                # Note: This is a simplified version - actual implementation
-                # may need to load audio and run through the tokenizer
-                audio_codes = ""
-                try:
-                    # TODO: Implement proper audio to codes conversion
-                    # using tokenizer.tokenize() once VAE is connected
-                    logger.debug(f"Audio encoding for sample {idx}")
-                except Exception as e:
-                    logger.warning(f"Could not encode audio for sample {idx}: {e}")
+                metadata = None
 
-                # Generate metadata
+                # Path 1: Format user-provided lyrics with LLM
                 if format_lyrics and sample.raw_lyrics:
-                    # Format user-provided lyrics
+                    logger.info(f"Formatting lyrics for sample {idx}: {sample.filename}")
                     metadata = llm.format_sample(
                         caption=sample.caption,
                         lyrics=sample.raw_lyrics,
-                        user_metadata={
-                            "bpm": sample.bpm,
-                            "keyscale": sample.keyscale,
-                        } if not skip_metas else None,
                     )
-                elif audio_codes:
-                    # Understand audio from codes
-                    metadata = llm.understand_audio_from_codes(audio_codes)
-                else:
-                    # No audio codes, generate basic metadata
-                    metadata = {
-                        "caption": f"Music track: {sample.filename}",
-                        "genre": "",
-                        "bpm": None,
-                        "keyscale": "",
-                        "timesignature": "4",
-                        "language": "instrumental",
-                        "lyrics": "[Instrumental]",
-                    }
 
-                # Update sample
+                else:
+                    # Path 2: Understand audio from codes
+                    # Convert audio to discrete codes via VAE + tokenizer
+                    logger.info(f"Encoding audio to codes for sample {idx}: {sample.filename}")
+                    try:
+                        codes = audio_to_codes(
+                            vae=vae,
+                            tokenizer=tokenizer,
+                            audio_path=sample.audio_path,
+                            device=device,
+                            dtype=dtype,
+                            max_duration=30.0,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Audio encoding failed for sample {idx}: {e}")
+                        codes = ""
+
+                    if codes:
+                        logger.info(
+                            f"Generated {len(codes)} chars of audio codes for sample {idx}, "
+                            f"calling LLM..."
+                        )
+                        metadata = llm.understand_audio_from_codes(codes)
+                    else:
+                        logger.warning(
+                            f"No audio codes for sample {idx}, skipping LLM labeling"
+                        )
+
+                # Apply metadata to sample
+                if metadata is None:
+                    errors.append(f"Sample {idx}: no metadata generated")
+                    if pbar:
+                        pbar.update(1)
+                    continue
+
                 if metadata.get("caption"):
                     sample.caption = metadata["caption"]
                 if metadata.get("genre"):
@@ -172,14 +193,20 @@ class FL_AceStep_LabelSamples:
                     sample.language = metadata["language"]
                     sample.is_instrumental = metadata["language"].lower() == "instrumental"
 
-                if transcribe_lyrics and metadata.get("lyrics"):
-                    sample.lyrics = metadata["lyrics"]
-                    sample.formatted_lyrics = metadata["lyrics"]
-                elif format_lyrics and metadata.get("lyrics"):
-                    sample.formatted_lyrics = metadata["lyrics"]
+                # Update lyrics from LLM output
+                if metadata.get("lyrics") and metadata["lyrics"] != "[Instrumental]":
+                    if transcribe_lyrics or format_lyrics:
+                        sample.lyrics = metadata["lyrics"]
+                        sample.formatted_lyrics = metadata["lyrics"]
+                        sample.is_instrumental = False
 
                 sample.labeled = True
                 labeled_count += 1
+
+                logger.info(
+                    f"Sample {idx} labeled: caption='{sample.caption[:60]}...', "
+                    f"bpm={sample.bpm}, key={sample.keyscale}"
+                )
 
             except Exception as e:
                 error_msg = f"Error labeling sample {idx}: {str(e)}"

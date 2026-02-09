@@ -5,6 +5,7 @@ Loads the 5Hz-lm model for audio understanding and auto-labeling.
 """
 
 import os
+import re
 import logging
 import torch
 
@@ -30,12 +31,25 @@ LLM_MODELS = [
 DEVICE_OPTIONS = ["auto", "cuda", "cpu"]
 BACKEND_OPTIONS = ["pt", "vllm"]
 
+# System instructions matching the official ACE-Step 5Hz-lm training format
+UNDERSTAND_INSTRUCTION = (
+    "# Instruction\n"
+    "Understand the given musical conditions and describe "
+    "the audio semantics accordingly:\n\n"
+)
+FORMAT_INSTRUCTION = (
+    "# Instruction\n"
+    "Format the user's input into a more detailed and "
+    "specific musical description:\n\n"
+)
+
 
 class ACEStepLLMHandler:
     """
     Handler for the 5Hz-lm model.
 
     Wraps the LLM for audio understanding and metadata generation.
+    Uses ChatML prompt format matching the official ACE-Step training.
     """
 
     def __init__(self, model, tokenizer, device, dtype, model_name):
@@ -57,29 +71,25 @@ class ACEStepLLMHandler:
         Generate metadata and lyrics from audio codes.
 
         Args:
-            audio_codes: String of audio code tokens
-            temperature: Sampling temperature
+            audio_codes: String of audio code tokens (e.g. "<|audio_code_123|>...")
+            temperature: Sampling temperature (0.3 = deterministic for metadata)
             top_k: Top-k sampling
             top_p: Nucleus sampling
             max_new_tokens: Maximum tokens to generate
 
         Returns:
-            Dictionary with generated metadata
+            Dictionary with generated metadata (caption, bpm, keyscale, etc.)
         """
-        # Build prompt for understanding
-        prompt = self._build_understanding_prompt(audio_codes)
-
-        # Generate
+        messages = self._build_understanding_messages(audio_codes)
         response = self._generate(
-            prompt,
+            messages,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
         )
-
-        # Parse response
-        return self._parse_understanding_response(response)
+        logger.info(f"LLM understanding response length: {len(response)}")
+        return self._parse_response(response)
 
     def format_sample(
         self,
@@ -90,89 +100,72 @@ class ACEStepLLMHandler:
         max_new_tokens: int = 2048,
     ):
         """
-        Format user-provided caption and lyrics.
+        Format user-provided caption and lyrics into structured metadata.
 
         Args:
             caption: User-provided caption
             lyrics: User-provided lyrics
-            user_metadata: Optional metadata dict
-            temperature: Sampling temperature
+            user_metadata: Optional metadata dict (unused, kept for API compat)
+            temperature: Sampling temperature (0.85 = creative for formatting)
             max_new_tokens: Maximum tokens to generate
 
         Returns:
             Dictionary with formatted metadata
         """
-        # Build prompt for formatting
-        prompt = self._build_formatting_prompt(caption, lyrics, user_metadata)
-
-        # Generate
+        messages = self._build_formatting_messages(caption, lyrics)
         response = self._generate(
-            prompt,
+            messages,
             temperature=temperature,
             max_new_tokens=max_new_tokens,
         )
+        logger.info(f"LLM formatting response length: {len(response)}")
+        return self._parse_response(response)
 
-        # Parse response
-        return self._parse_formatting_response(response)
+    def _build_understanding_messages(self, audio_codes: str) -> list:
+        """Build ChatML messages for audio understanding."""
+        return [
+            {"role": "system", "content": UNDERSTAND_INSTRUCTION},
+            {"role": "user", "content": audio_codes},
+        ]
 
-    def _build_understanding_prompt(self, audio_codes: str) -> str:
-        """Build prompt for audio understanding."""
-        return f"""You are an AI assistant that analyzes music. Given the following audio codes, describe the music.
-
-Audio codes: {audio_codes}
-
-Please provide:
-1. A caption describing the music style, mood, and instrumentation
-2. The estimated BPM (tempo)
-3. The key/scale (e.g., C Major, Am)
-4. The time signature (2, 3, 4, or 6)
-5. The language of vocals (or "instrumental" if no vocals)
-6. Genre tags
-7. Lyrics (if applicable, or "[Instrumental]")
-
-Format your response as:
-Caption: [description]
-BPM: [number]
-Key: [key/scale]
-TimeSignature: [number]
-Language: [language]
-Genre: [genre tags]
-Lyrics:
-[lyrics or [Instrumental]]
-"""
-
-    def _build_formatting_prompt(self, caption: str, lyrics: str, metadata: dict) -> str:
-        """Build prompt for sample formatting."""
-        meta_str = ""
-        if metadata:
-            meta_str = f"\nExisting metadata: {metadata}"
-
-        return f"""You are an AI assistant that formats music metadata. Please format the following information.
-
-Caption: {caption}
-Lyrics: {lyrics}{meta_str}
-
-Please provide formatted output as:
-Caption: [enhanced caption]
-BPM: [estimated number]
-Key: [key/scale]
-TimeSignature: [number]
-Language: [language]
-Genre: [genre tags]
-Lyrics:
-[formatted lyrics]
-"""
+    def _build_formatting_messages(self, caption: str, lyrics: str) -> list:
+        """Build ChatML messages for sample formatting."""
+        caption = caption or "NO USER INPUT"
+        lyrics = lyrics or "[Instrumental]"
+        user_content = f"# Caption\n{caption}\n\n# Lyric\n{lyrics}"
+        return [
+            {"role": "system", "content": FORMAT_INSTRUCTION},
+            {"role": "user", "content": user_content},
+        ]
 
     def _generate(
         self,
-        prompt: str,
+        messages: list,
         temperature: float = 0.7,
         top_k: int = 50,
         top_p: float = 0.95,
         max_new_tokens: int = 2048,
     ) -> str:
-        """Generate response from LLM."""
+        """
+        Generate response from LLM using ChatML prompt format.
+
+        Args:
+            messages: List of ChatML message dicts (role, content)
+            temperature: Sampling temperature
+            top_k: Top-k sampling
+            top_p: Nucleus sampling
+            max_new_tokens: Maximum tokens to generate
+
+        Returns:
+            Raw response string (with <think> tags preserved)
+        """
+        # Apply ChatML template
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        input_length = inputs.input_ids.shape[1]
 
         with torch.no_grad():
             outputs = self.model.generate(
@@ -185,16 +178,36 @@ Lyrics:
                 pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
             )
 
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Decode only the generated tokens (not the prompt)
+        generated_ids = outputs[0][input_length:]
+        response = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
 
-        # Remove the prompt from response
-        if response.startswith(prompt):
-            response = response[len(prompt):]
+        # Strip trailing end tokens
+        for end_token in ["<|im_end|>", "<|endoftext|>"]:
+            response = response.replace(end_token, "")
 
         return response.strip()
 
-    def _parse_understanding_response(self, response: str) -> dict:
-        """Parse understanding response into metadata dict."""
+    def _parse_response(self, response: str) -> dict:
+        """
+        Parse LLM response containing <think> tags with YAML metadata
+        and optional lyrics after </think>.
+
+        Expected format:
+            <think>
+            bpm: 120
+            caption: A driving electronic track...
+            duration: 180
+            genres: Electronic, Synthwave
+            keyscale: A minor
+            language: en
+            timesignature: 4
+            </think>
+
+            # Lyric
+            [Verse 1]
+            Walking through the city lights...
+        """
         result = {
             "caption": "",
             "bpm": None,
@@ -205,44 +218,113 @@ Lyrics:
             "lyrics": "[Instrumental]",
         }
 
-        lines = response.split("\n")
-        current_field = None
-        lyrics_lines = []
+        # Extract <think>...</think> block
+        think_match = re.search(r'<think>(.*?)</think>', response, re.DOTALL)
+        if not think_match:
+            logger.warning("No <think> tags found in LLM response, attempting plain parse")
+            logger.debug(f"Response: {response[:500]}")
+            return self._parse_plain_response(response, result)
 
-        for line in lines:
-            line = line.strip()
-            if not line:
+        think_content = think_match.group(1).strip()
+
+        # Parse YAML-style key:value pairs inside think block
+        current_key = None
+        current_value_lines = []
+
+        for line in think_content.split('\n'):
+            stripped = line.strip()
+            if not stripped or stripped.startswith('<'):
                 continue
 
-            if line.lower().startswith("caption:"):
-                result["caption"] = line.split(":", 1)[1].strip()
-            elif line.lower().startswith("bpm:"):
-                try:
-                    result["bpm"] = int(line.split(":", 1)[1].strip())
-                except:
-                    pass
-            elif line.lower().startswith("key:"):
-                result["keyscale"] = line.split(":", 1)[1].strip()
-            elif line.lower().startswith("timesignature:"):
-                result["timesignature"] = line.split(":", 1)[1].strip()
-            elif line.lower().startswith("language:"):
-                result["language"] = line.split(":", 1)[1].strip().lower()
-            elif line.lower().startswith("genre:"):
-                result["genre"] = line.split(":", 1)[1].strip()
-            elif line.lower().startswith("lyrics:"):
-                current_field = "lyrics"
-            elif current_field == "lyrics":
-                lyrics_lines.append(line)
+            # Check if this is a new key:value pair (not indented, has colon)
+            if ':' in stripped and not line.startswith((' ', '\t')):
+                # Save previous field
+                if current_key and current_value_lines:
+                    self._set_metadata_field(
+                        result, current_key,
+                        ' '.join(v.strip() for v in current_value_lines if v.strip())
+                    )
 
-        if lyrics_lines:
-            result["lyrics"] = "\n".join(lyrics_lines)
+                key, value = stripped.split(':', 1)
+                current_key = key.strip().lower()
+                current_value_lines = [value] if value.strip() else []
+            elif current_key:
+                # Continuation line (multi-line YAML value)
+                current_value_lines.append(stripped)
+
+        # Save last field
+        if current_key and current_value_lines:
+            self._set_metadata_field(
+                result, current_key,
+                ' '.join(v.strip() for v in current_value_lines if v.strip())
+            )
+
+        # Extract lyrics after </think>
+        after_think = response.split('</think>', 1)
+        if len(after_think) > 1:
+            lyrics_content = after_think[1].strip()
+
+            # Remove # Lyric header
+            lyrics_content = re.sub(
+                r'^#\s*Lyric[s]?\s*\n?', '', lyrics_content, flags=re.IGNORECASE
+            )
+            lyrics_content = lyrics_content.strip()
+
+            if lyrics_content and lyrics_content.lower() != "[instrumental]":
+                result["lyrics"] = lyrics_content
+                # If we got real lyrics and language is still default, set to unknown
+                if result["language"] == "instrumental":
+                    result["language"] = "unknown"
 
         return result
 
-    def _parse_formatting_response(self, response: str) -> dict:
-        """Parse formatting response into metadata dict."""
-        # Same parsing logic as understanding
-        return self._parse_understanding_response(response)
+    def _set_metadata_field(self, result: dict, key: str, value: str):
+        """Set a metadata field from a parsed YAML key:value pair."""
+        if not value:
+            return
+
+        if key == "bpm":
+            try:
+                result["bpm"] = int(float(value))
+            except (ValueError, TypeError):
+                pass
+        elif key == "caption":
+            result["caption"] = value
+        elif key in ("keyscale", "key"):
+            result["keyscale"] = value
+        elif key == "timesignature":
+            result["timesignature"] = value
+        elif key == "language":
+            result["language"] = value.lower()
+        elif key in ("genre", "genres"):
+            result["genre"] = value
+        # duration is ignored - we get it from the audio file
+
+    def _parse_plain_response(self, response: str, result: dict) -> dict:
+        """Fallback parser for responses without <think> tags."""
+        for line in response.split('\n'):
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            lower = stripped.lower()
+            if lower.startswith("caption:"):
+                result["caption"] = stripped.split(":", 1)[1].strip()
+            elif lower.startswith("bpm:"):
+                try:
+                    result["bpm"] = int(stripped.split(":", 1)[1].strip())
+                except (ValueError, TypeError):
+                    pass
+            elif lower.startswith(("key:", "keyscale:")):
+                result["keyscale"] = stripped.split(":", 1)[1].strip()
+            elif lower.startswith("timesignature:"):
+                result["timesignature"] = stripped.split(":", 1)[1].strip()
+            elif lower.startswith("language:"):
+                result["language"] = stripped.split(":", 1)[1].strip().lower()
+            elif lower.startswith(("genre:", "genres:")):
+                result["genre"] = stripped.split(":", 1)[1].strip()
+
+        return result
 
 
 class FL_AceStep_LLMLoader:
