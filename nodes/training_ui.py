@@ -95,7 +95,8 @@ def collate_fn(batch):
         }
 
     # Handle multiple items (variable length padding)
-    max_len = max(item["target_latents"].shape[0] for item in batch)
+    max_latent_len = max(item["target_latents"].shape[0] for item in batch)
+    max_enc_len = max(item["encoder_hidden_states"].shape[0] for item in batch)
 
     batched = {
         "target_latents": [],
@@ -108,8 +109,8 @@ def collate_fn(batch):
     for item in batch:
         # Pad target latents
         t_len = item["target_latents"].shape[0]
-        if t_len < max_len:
-            pad_len = max_len - t_len
+        if t_len < max_latent_len:
+            pad_len = max_latent_len - t_len
             target = F.pad(item["target_latents"], (0, 0, 0, pad_len))
             mask = F.pad(item["attention_mask"], (0, pad_len), value=0)
             context = F.pad(item["context_latents"], (0, 0, 0, pad_len))
@@ -118,10 +119,20 @@ def collate_fn(batch):
             mask = item["attention_mask"]
             context = item["context_latents"]
 
+        # Pad encoder sequences
+        e_len = item["encoder_hidden_states"].shape[0]
+        if e_len < max_enc_len:
+            enc_pad = max_enc_len - e_len
+            enc_hidden = F.pad(item["encoder_hidden_states"], (0, 0, 0, enc_pad))
+            enc_mask = F.pad(item["encoder_attention_mask"], (0, enc_pad), value=0)
+        else:
+            enc_hidden = item["encoder_hidden_states"]
+            enc_mask = item["encoder_attention_mask"]
+
         batched["target_latents"].append(target)
         batched["attention_mask"].append(mask)
-        batched["encoder_hidden_states"].append(item["encoder_hidden_states"])
-        batched["encoder_attention_mask"].append(item["encoder_attention_mask"])
+        batched["encoder_hidden_states"].append(enc_hidden)
+        batched["encoder_attention_mask"].append(enc_mask)
         batched["context_latents"].append(context)
 
     return {
@@ -160,8 +171,13 @@ class FL_AceStep_Train:
                 "model": ("MODEL",),  # Native ComfyUI MODEL type (purple connection)
                 "config": ("ACESTEP_TRAINING_CONFIG",),
                 "tensor_dir": ("STRING", {
-                    "default": "./datasets/preprocessed",
+                    "default": "./output/acestep/datasets",
                     "multiline": False,
+                }),
+                "lora_name": ("STRING", {
+                    "default": "my_lora",
+                    "multiline": False,
+                    "placeholder": "Name for the trained LoRA",
                 }),
             },
             "optional": {
@@ -186,9 +202,9 @@ class FL_AceStep_Train:
     # before the function starts executing. Without this, all tensor operations
     # inside the function will have gradient tracking disabled.
     @torch.inference_mode(False)
-    def train(self, model, config, tensor_dir, resume_from="", unique_id=None):
+    def train(self, model, config, tensor_dir, lora_name="my_lora", resume_from="", unique_id=None):
         """Run the training loop."""
-        logger.info("Starting ACE-Step LoRA training...")
+        logger.info(f"Starting ACE-Step LoRA training: {lora_name}")
 
         # Verify this is an ACE-Step model
         if not is_acestep_model(model):
@@ -244,8 +260,10 @@ class FL_AceStep_Train:
             "message": "Initializing training...",
         })
 
-        # Create output directory
-        output_dir = Path(training_config.output_dir)
+        # Create output directory using lora_name as subfolder
+        # Sanitize lora_name for filesystem use
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in lora_name).strip("_") or "my_lora"
+        output_dir = Path(training_config.output_dir) / safe_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Load dataset
@@ -275,10 +293,6 @@ class FL_AceStep_Train:
         try:
             from peft import get_peft_model, LoraConfig
 
-            # NOTE: Do NOT set task_type - it causes PEFT to inject unwanted
-            # arguments (like input_ids) into the forward pass.
-            # The official ACE-Step code uses TaskType.FEATURE_EXTRACTION but
-            # their model architecture differs from ComfyUI's version.
             peft_config = LoraConfig(
                 r=lora_config.r,
                 lora_alpha=lora_config.alpha,
@@ -630,14 +644,9 @@ class FL_AceStep_Train:
             for name, cls in lora_layers_found[:5]:
                 logger.info(f"  {name}: {cls}")
 
-            # Get text projector for dimension conversion (1024 -> 2048)
-            # ACE-Step decoder expects 2048-dim, but ComfyUI CLIP may output 1024-dim
-            # Note: text_projector was already replaced during encoder Linear replacement above
-            text_projector = None
-            if hasattr(dit, 'encoder') and hasattr(dit.encoder, 'text_projector'):
-                text_projector = dit.encoder.text_projector.to(device).to(dtype)
-                text_projector.eval()  # Keep frozen during training
-                logger.info(f"Using text_projector for 1024->2048 dimension conversion ({text_projector.in_features} -> {text_projector.out_features})")
+            # Note: text_projector is no longer needed here.
+            # Preprocessing now runs the full condition encoder (text_projector + lyric_encoder
+            # + pack_sequences) to produce combined 2048-dim encoder_hidden_states.
 
             # Log trainable params
             trainable_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
@@ -752,11 +761,6 @@ class FL_AceStep_Train:
                         encoder_hidden_states = batch["encoder_hidden_states"].to(device).to(dtype)
                         encoder_attention_mask = batch["encoder_attention_mask"].to(device)
                         context_latents = batch["context_latents"].to(device).to(dtype)
-
-                        # Project encoder_hidden_states from CLIP's 1024-dim to decoder's 2048-dim
-                        if text_projector is not None and encoder_hidden_states.shape[-1] == 1024:
-                            with torch.no_grad():  # Don't train the projector
-                                encoder_hidden_states = text_projector(encoder_hidden_states)
 
                         bsz = target_latents.shape[0]
 
@@ -1046,6 +1050,11 @@ class FL_AceStep_Train:
                     config_dict = config.to_dict()
                 else:
                     config_dict = {"peft_type": "LORA", "r": 64, "lora_alpha": 128}
+                # Convert sets to lists for JSON serialization
+                # (PEFT returns target_modules as a set)
+                for key, value in config_dict.items():
+                    if isinstance(value, set):
+                        config_dict[key] = sorted(list(value))
                 with open(adapter_dir / "adapter_config.json", "w") as f:
                     json.dump(config_dict, f, indent=2)
 

@@ -14,8 +14,8 @@ logger = logging.getLogger("FL_AceStep_Training")
 @dataclass
 class LoRAConfig:
     """LoRA adapter configuration."""
-    r: int = 64  # LoRA rank
-    alpha: int = 128  # LoRA alpha (scaling factor)
+    r: int = 8  # LoRA rank
+    alpha: int = 16  # LoRA alpha (scaling factor)
     dropout: float = 0.1  # LoRA dropout
     target_modules: List[str] = field(default_factory=lambda: [
         "q_proj", "k_proj", "v_proj", "o_proj"
@@ -31,17 +31,17 @@ class TrainingConfig:
     num_inference_steps: int = 8
 
     # Trainable parameters
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
     batch_size: int = 1
-    gradient_accumulation_steps: int = 1
-    max_epochs: int = 1000
-    save_every_n_epochs: int = 200
+    gradient_accumulation_steps: int = 4
+    max_epochs: int = 100
+    save_every_n_epochs: int = 10
     warmup_steps: int = 100
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
 
     # Output
-    output_dir: str = "./lora_output"
+    output_dir: str = "./output/acestep/loras"
     seed: int = 42
 
     # Always bf16
@@ -55,15 +55,15 @@ class FL_AceStep_TrainingConfig:
     Configure LoRA adapter and training hyperparameters.
 
     LoRA Settings:
-    - rank: Higher rank = more capacity, more VRAM (typical: 8-128)
-    - alpha: Scaling factor, usually 2x rank
+    - rank: Higher rank = more capacity, more VRAM (typical: 4-64, default: 8)
+    - alpha: Scaling factor, usually 2x rank (default: 16)
     - dropout: Regularization (typical: 0.05-0.2)
 
     Training Settings:
-    - learning_rate: Start with 1e-4 to 3e-4
-    - max_epochs: 500-2000 depending on dataset size
+    - learning_rate: 1e-4 recommended (default)
+    - max_epochs: 50-200 depending on dataset size (default: 100)
     - batch_size: Usually 1 due to VRAM constraints
-    - gradient_accumulation: Effective batch = batch_size * accumulation
+    - gradient_accumulation: Effective batch = batch_size * accumulation (default: 4)
 
     Note: The turbo model uses fixed 8-step discrete timesteps with shift=3.0
     """
@@ -74,13 +74,13 @@ class FL_AceStep_TrainingConfig:
             "required": {
                 # LoRA Config
                 "lora_rank": ("INT", {
-                    "default": 64,
+                    "default": 8,
                     "min": 4,
                     "max": 256,
                     "step": 4,
                 }),
                 "lora_alpha": ("INT", {
-                    "default": 128,
+                    "default": 16,
                     "min": 4,
                     "max": 512,
                     "step": 4,
@@ -94,16 +94,16 @@ class FL_AceStep_TrainingConfig:
 
                 # Training Config
                 "learning_rate": ("FLOAT", {
-                    "default": 3e-4,
+                    "default": 1e-4,
                     "min": 1e-6,
                     "max": 1e-2,
                     "step": 1e-5,
                 }),
                 "max_epochs": ("INT", {
-                    "default": 1000,
-                    "min": 100,
+                    "default": 100,
+                    "min": 10,
                     "max": 10000,
-                    "step": 100,
+                    "step": 10,
                 }),
                 "batch_size": ("INT", {
                     "default": 1,
@@ -112,20 +112,20 @@ class FL_AceStep_TrainingConfig:
                     "step": 1,
                 }),
                 "gradient_accumulation": ("INT", {
-                    "default": 1,
+                    "default": 4,
                     "min": 1,
                     "max": 16,
                     "step": 1,
                 }),
                 "save_every_n_epochs": ("INT", {
-                    "default": 200,
-                    "min": 50,
+                    "default": 10,
+                    "min": 5,
                     "max": 1000,
-                    "step": 50,
+                    "step": 5,
                 }),
 
                 "output_dir": ("STRING", {
-                    "default": "./lora_output",
+                    "default": "./output/acestep/loras",
                     "multiline": False,
                 }),
                 "seed": ("INT", {

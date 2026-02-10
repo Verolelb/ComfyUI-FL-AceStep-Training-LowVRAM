@@ -116,7 +116,7 @@ VAE-encodes audio and CLIP-encodes text to `.pt` tensor files for training.
 | model | MODEL | — | ACE-Step model (purple) |
 | vae | VAE | — | ACE-Step VAE (red) |
 | clip | CLIP | — | ACE-Step CLIP (yellow) |
-| output_dir | STRING | `./datasets/preprocessed` | — |
+| output_dir | STRING | `./output/acestep/datasets` | — |
 | max_duration | FLOAT | `240.0` | 10–600 seconds |
 | genre_ratio | INT | `0` | 0–100% chance to use genre instead of caption |
 
@@ -126,14 +126,14 @@ VAE-encodes audio and CLIP-encodes text to `.pt` tensor files for training.
 
 | Parameter | Default | Range |
 |-----------|---------|-------|
-| LoRA Rank | 64 | 4–256 (step 4) |
-| LoRA Alpha | 128 | 4–512 (step 4) |
+| LoRA Rank | 8 | 4–256 (step 4) |
+| LoRA Alpha | 16 | 4–512 (step 4) |
 | LoRA Dropout | 0.1 | 0–0.5 |
-| Learning Rate | 3e-4 | 1e-6 – 1e-2 |
-| Max Epochs | 1000 | 100–10000 |
+| Learning Rate | 1e-4 | 1e-6 – 1e-2 |
+| Max Epochs | 100 | 10–10000 |
 | Batch Size | 1 | 1–8 |
-| Gradient Accumulation | 1 | 1–16 |
-| Save Every N Epochs | 200 | 50–1000 |
+| Gradient Accumulation | 4 | 1–16 |
+| Save Every N Epochs | 10 | 5–1000 |
 | Seed | 42 | — |
 | **Optional** | | |
 | Warmup Steps | 100 | 0–1000 |
@@ -153,7 +153,8 @@ Runs the training loop with flow matching loss: `MSE(predicted_v, x1 - x0)`.
 |-------|------|---------|-------|
 | model | MODEL | — | ACE-Step model (purple) |
 | config | ACESTEP_TRAINING_CONFIG | — | From config node |
-| tensor_dir | STRING | `./datasets/preprocessed` | Directory of `.pt` files |
+| tensor_dir | STRING | `./output/acestep/datasets` | Directory of `.pt` files |
+| lora_name | STRING | `my_lora` | Name for the trained LoRA (used as subfolder) |
 | resume_from | STRING | *(empty)* | Path to checkpoint to resume from |
 
 **Outputs:** MODEL (with LoRA), final LoRA path, status

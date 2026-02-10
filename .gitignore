@@ -73,10 +73,12 @@ output_*.wav
 *.safetensors
 *.ckpt
 
-# Training output
+# Training output (old paths)
 lora_output/
 datasets/
 preprocessed/
+# Training output (new paths under ComfyUI output/)
+output/
 
 # Jupyter
 .ipynb_checkpoints/

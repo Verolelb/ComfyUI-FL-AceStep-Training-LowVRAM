@@ -19,6 +19,7 @@ except ImportError:
 from ..modules.acestep_model import (
     is_acestep_model,
     get_silence_latent,
+    get_acestep_encoder,
 )
 from ..modules.audio_utils import load_audio, vae_encode
 
@@ -38,77 +39,53 @@ SFT_GEN_PROMPT = """# Instruction
 DEFAULT_DIT_INSTRUCTION = "Fill the audio semantic mask based on the given conditions:"
 
 
-def encode_text_with_clip(clip, text: str, device, dtype):
+def encode_text_and_lyrics(clip, text: str, lyrics: str, device, dtype):
     """
-    Encode text using ComfyUI's native CLIP.
+    Encode text and lyrics using ComfyUI's native CLIP pipeline.
 
-    ComfyUI CLIP from checkpoint has a different API than our custom wrapper.
-    This function handles both cases.
+    For ACE-Step 1.5, this uses the Qwen3 model:
+    - Text: Full forward pass → last_hidden_state
+    - Lyrics: Layer 0 output only (shallow embedding)
 
     Args:
-        clip: ComfyUI CLIP object
-        text: Text to encode
+        clip: ComfyUI CLIP object (ACE-Step text encoder)
+        text: Caption/prompt text
+        lyrics: Lyrics text (or "[Instrumental]")
         device: Device to use
         dtype: Data type to use
 
     Returns:
-        Tuple of (hidden_states, attention_mask)
+        Tuple of (text_hidden_states, text_attention_mask,
+                  lyric_hidden_states, lyric_attention_mask)
     """
-    # Try our custom wrapper's encode method first
-    if hasattr(clip, 'encode') and callable(clip.encode):
-        try:
-            # Check if it accepts max_length (our custom wrapper)
-            import inspect
-            sig = inspect.signature(clip.encode)
-            if 'max_length' in sig.parameters:
-                return clip.encode(text, max_length=256)
-        except (TypeError, ValueError):
-            pass
+    # Tokenize text and lyrics together — ComfyUI handles the separation
+    tokens = clip.tokenize(text, lyrics=lyrics)
 
-    # Use ComfyUI's native CLIP encoding
-    # ComfyUI CLIP uses tokenize() -> encode_from_tokens()
-    if hasattr(clip, 'tokenize'):
-        # Native ComfyUI CLIP
-        tokens = clip.tokenize(text)
+    # Encode with return_dict to get both text and lyrics embeddings
+    result = clip.encode_from_tokens(tokens, return_pooled=True, return_dict=True)
 
-        # encode_from_tokens returns conditioning in ComfyUI format
-        if hasattr(clip, 'encode_from_tokens'):
-            cond, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
-            # cond is the hidden states tensor
-            hidden_states = cond.to(device).to(dtype)
-            # Create attention mask (all ones for valid tokens)
-            attention_mask = torch.ones(hidden_states.shape[:2], device=device, dtype=dtype)
-            return hidden_states, attention_mask
-
-    # Fallback: Try to access the underlying model directly
-    if hasattr(clip, 'cond_stage_model'):
-        model = clip.cond_stage_model
-        if hasattr(model, 'tokenizer') and hasattr(model, 'transformer'):
-            tokenizer = model.tokenizer
-            transformer = model.transformer
-
-            # Tokenize
-            inputs = tokenizer(
-                text,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=256
-            )
-
-            input_ids = inputs['input_ids'].to(device)
-            attention_mask = inputs['attention_mask'].to(device).to(dtype)
-
-            # Encode
-            outputs = transformer(input_ids)
-            hidden_states = outputs.last_hidden_state.to(dtype)
-
-            return hidden_states, attention_mask
-
-    raise RuntimeError(
-        "Could not encode text with CLIP. The CLIP object doesn't have a compatible API. "
-        "Please use the ACE-Step CLIP Loader node instead of the native checkpoint loader."
+    # Text hidden states (the main conditioning)
+    text_hidden_states = result["cond"].to(device).to(dtype)
+    text_attention_mask = torch.ones(
+        text_hidden_states.shape[:2], device=device, dtype=dtype
     )
+
+    # Lyrics embeddings — ComfyUI returns these separately
+    lyric_hidden_states = result.get("conditioning_lyrics", None)
+    if lyric_hidden_states is not None:
+        lyric_hidden_states = lyric_hidden_states.to(device).to(dtype)
+        if lyric_hidden_states.dim() == 2:
+            lyric_hidden_states = lyric_hidden_states.unsqueeze(0)
+        lyric_attention_mask = torch.ones(
+            lyric_hidden_states.shape[:2], device=device, dtype=dtype
+        )
+    else:
+        # Fallback: empty lyrics
+        lyric_hidden_states = torch.zeros(1, 1, text_hidden_states.shape[-1],
+                                          device=device, dtype=dtype)
+        lyric_attention_mask = torch.zeros(1, 1, device=device, dtype=dtype)
+
+    return text_hidden_states, text_attention_mask, lyric_hidden_states, lyric_attention_mask
 
 
 class FL_AceStep_PreprocessDataset:
@@ -118,8 +95,7 @@ class FL_AceStep_PreprocessDataset:
     Converts labeled audio samples to preprocessed tensor files for training.
     This is a critical step that:
     - Encodes audio to VAE latents
-    - Encodes captions and metadata to text embeddings
-    - Encodes lyrics to separate embeddings
+    - Encodes captions/metadata and lyrics to combined embeddings via condition encoder
     - Creates context latents with silence patterns
     - Saves everything as .pt files
 
@@ -143,7 +119,7 @@ class FL_AceStep_PreprocessDataset:
                 "vae": ("VAE",),  # Native ComfyUI VAE type (from checkpoint)
                 "clip": ("CLIP",),
                 "output_dir": ("STRING", {
-                    "default": "./datasets/preprocessed",
+                    "default": "./output/acestep/datasets",
                     "multiline": False,
                 }),
             },
@@ -219,6 +195,19 @@ class FL_AceStep_PreprocessDataset:
             # Create a default silence latent (zeros)
             silence_latent = torch.zeros(1, 750, 64, device=device, dtype=dtype)
 
+        # Get the condition encoder from the DiT model
+        # This merges text + lyrics into combined encoder_hidden_states
+        condition_encoder = get_acestep_encoder(model)
+        # The encoder may be on CPU (ComfyUI model management) — move to GPU
+        # and detect its native dtype (typically bfloat16, different from VAE's float16)
+        enc_param = next(condition_encoder.parameters())
+        enc_dtype = enc_param.dtype
+        logger.info(f"Condition encoder dtype: {enc_dtype}, device: {enc_param.device}")
+        if enc_param.device != device:
+            logger.info(f"Moving condition encoder to {device}")
+            condition_encoder.to(device)
+        logger.info("Got condition encoder for text+lyrics merging")
+
         # Progress bar
         pbar = ProgressBar(len(labeled_samples)) if ProgressBar else None
 
@@ -233,6 +222,7 @@ class FL_AceStep_PreprocessDataset:
                     sample=sample,
                     vae=vae,
                     clip=clip,
+                    condition_encoder=condition_encoder,
                     silence_latent=silence_latent,
                     max_duration=max_duration,
                     genre_ratio=genre_ratio,
@@ -300,6 +290,7 @@ class FL_AceStep_PreprocessDataset:
         sample,
         vae,
         clip,
+        condition_encoder,
         silence_latent,
         max_duration,
         genre_ratio,
@@ -346,17 +337,13 @@ class FL_AceStep_PreprocessDataset:
         else:
             text_content = caption
 
-        # Build metadata string
-        metas = []
-        if sample.bpm:
-            metas.append(f"- bpm: {sample.bpm}")
-        if sample.timesignature:
-            metas.append(f"- timesignature: {sample.timesignature}")
-        if sample.keyscale:
-            metas.append(f"- keyscale: {sample.keyscale}")
-        metas.append(f"- duration: {int(sample.duration)} seconds")
-
-        metas_str = "\n".join(metas) if metas else ""
+        # Build metadata string (always include all fields, N/A for missing — matches official)
+        metas_str = (
+            f"- bpm: {sample.bpm if sample.bpm else 'N/A'}\n"
+            f"- timesignature: {sample.timesignature if sample.timesignature else 'N/A'}\n"
+            f"- keyscale: {sample.keyscale if sample.keyscale else 'N/A'}\n"
+            f"- duration: {int(sample.duration)} seconds\n"
+        )
 
         # Build SFT prompt
         text_prompt = SFT_GEN_PROMPT.format(
@@ -365,23 +352,35 @@ class FL_AceStep_PreprocessDataset:
             metas_str
         )
 
-        # Encode text using ComfyUI's native CLIP API
-        logger.info(f"Encoding text prompt (len={len(text_prompt)})")
-        with torch.no_grad():
-            encoder_hidden_states, encoder_attention_mask = encode_text_with_clip(
-                clip, text_prompt, device, dtype
-            )
-        logger.info(f"Text encoder output shape: {encoder_hidden_states.shape}")
-
-        # Encode lyrics
+        # Encode text and lyrics using ComfyUI's native CLIP pipeline
         lyrics = sample.lyrics if sample.lyrics else "[Instrumental]"
-        logger.info(f"Encoding lyrics (len={len(lyrics)})")
+        logger.info(f"Encoding text (len={len(text_prompt)}) + lyrics (len={len(lyrics)})")
 
         with torch.no_grad():
-            lyric_hidden_states, lyric_attention_mask = encode_text_with_clip(
-                clip, lyrics, device, dtype
+            # Step 1: Encode text and lyrics via ComfyUI CLIP
+            # For ACE-Step 1.5: text = full Qwen3 forward, lyrics = layer 0 only
+            enc_dtype = next(condition_encoder.parameters()).dtype
+            text_hidden_states, text_attention_mask, lyric_hidden_states, lyric_attention_mask = \
+                encode_text_and_lyrics(clip, text_prompt, lyrics, device, enc_dtype)
+            logger.info(
+                f"Text shape: {text_hidden_states.shape}, lyrics shape: {lyric_hidden_states.shape}, "
+                f"dtype: {text_hidden_states.dtype}"
             )
-        logger.info(f"Lyric encoder output shape: {lyric_hidden_states.shape}")
+
+            # Step 2: Run through condition encoder to merge text+lyrics+timbre
+            # Pass zero tensors for refer_audio (not None) — matches official implementation
+            refer_audio_hidden = torch.zeros(1, 1, 64, device=device, dtype=enc_dtype)
+            refer_audio_order_mask = torch.zeros(1, device=device, dtype=torch.long)
+
+            encoder_hidden_states, encoder_attention_mask = condition_encoder(
+                text_hidden_states=text_hidden_states,
+                text_attention_mask=text_attention_mask,
+                lyric_hidden_states=lyric_hidden_states,
+                lyric_attention_mask=lyric_attention_mask,
+                refer_audio_acoustic_hidden_states_packed=refer_audio_hidden,
+                refer_audio_order_mask=refer_audio_order_mask,
+            )
+        logger.info(f"Condition encoder output shape: {encoder_hidden_states.shape}")
 
         # Create context latents
         # Context = [silence_latent, chunk_masks]
@@ -404,13 +403,12 @@ class FL_AceStep_PreprocessDataset:
         context_latents = torch.cat([src_latents, chunk_masks], dim=-1)  # [1, T, 128]
 
         # Prepare output tensors (remove batch dimension for storage)
+        # encoder_hidden_states already contains merged text+lyrics from condition encoder
         tensor_data = {
             "target_latents": target_latents.squeeze(0).cpu(),  # [T, 64]
             "attention_mask": attention_mask.squeeze(0).cpu(),  # [T]
-            "encoder_hidden_states": encoder_hidden_states.squeeze(0).cpu(),  # [L, D]
+            "encoder_hidden_states": encoder_hidden_states.squeeze(0).cpu(),  # [L, 2048] (merged text+lyrics)
             "encoder_attention_mask": encoder_attention_mask.squeeze(0).cpu(),  # [L]
-            "lyric_hidden_states": lyric_hidden_states.squeeze(0).cpu(),  # [L, D]
-            "lyric_attention_mask": lyric_attention_mask.squeeze(0).cpu(),  # [L]
             "context_latents": context_latents.squeeze(0).cpu(),  # [T, 128]
             "metadata": {
                 "audio_path": sample.audio_path,
