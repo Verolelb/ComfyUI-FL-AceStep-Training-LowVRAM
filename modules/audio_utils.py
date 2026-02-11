@@ -24,6 +24,9 @@ logger = logging.getLogger("FL_AceStep_Training")
 SAMPLE_RATE = 48000
 MIN_SAMPLES = SAMPLE_RATE  # 1 second minimum
 
+# Cache resamplers to avoid rebuilding filter kernels per sample
+_RESAMPLER_CACHE: dict = {}
+
 
 def load_audio(audio_path: str, max_duration: float = None) -> Tuple[torch.Tensor, int]:
     """
@@ -46,10 +49,12 @@ def load_audio(audio_path: str, max_duration: float = None) -> Tuple[torch.Tenso
     else:
         waveform, sr = torchaudio.load(audio_path)
 
-    # Resample to 48kHz
+    # Resample to 48kHz (cache resampler to avoid rebuilding filter kernels)
     if sr != SAMPLE_RATE:
-        resampler = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
-        waveform = resampler(waveform)
+        cache_key = (sr, SAMPLE_RATE)
+        if cache_key not in _RESAMPLER_CACHE:
+            _RESAMPLER_CACHE[cache_key] = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
+        waveform = _RESAMPLER_CACHE[cache_key](waveform)
 
     # Validate minimum duration
     if waveform.shape[-1] < MIN_SAMPLES:
@@ -94,21 +99,33 @@ def vae_encode(vae, audio_tensor: torch.Tensor) -> torch.Tensor:
     # (it internally does movedim(-1, 1) to get [B, C, T])
     audio_for_vae = audio_tensor.movedim(1, -1)  # [B, C, T] -> [B, T, C]
 
-    logger.info(
-        f"[ACEStep] VAE encoding audio: {audio_tensor.shape[2] / SAMPLE_RATE:.1f}s "
-        f"({audio_tensor.shape})"
-    )
-
     # ComfyUI's encode() returns [B, 64, T_latent] and handles all
     # device management, tiling, and OOM recovery internally
     latents = vae.encode(audio_for_vae)  # [B, 64, T_latent]
 
     # Transpose to [B, T_latent, 64] for training/tokenization
-    latents = latents.transpose(1, 2)
+    return latents.transpose(1, 2)
 
-    logger.info(f"[ACEStep] VAE encode complete: latent shape {latents.shape}")
 
-    return latents
+def vae_encode_direct(vae_model, audio_tensor: torch.Tensor, device, dtype) -> torch.Tensor:
+    """
+    Encode audio to latent space by calling the VAE model directly.
+
+    Bypasses ComfyUI's vae.encode() wrapper (which calls load_models_gpu on
+    every invocation) for batch preprocessing where the model is already loaded.
+
+    Args:
+        vae_model: The underlying VAE model (vae.first_stage_model)
+        audio_tensor: Audio tensor [B, C, T] at 48kHz (stereo, C=2)
+        device: Device the VAE is on
+        dtype: dtype of the VAE
+
+    Returns:
+        latents: Latent tensor [B, T_latent, 64]
+    """
+    audio_in = audio_tensor.to(device=device, dtype=dtype)
+    latents = vae_model.encode(audio_in)  # [B, 64, T_latent]
+    return latents.transpose(1, 2).float()  # [B, T_latent, 64]
 
 
 def audio_to_codes(
