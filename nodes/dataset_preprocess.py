@@ -187,7 +187,11 @@ class FL_AceStep_PreprocessDataset:
         logger.info(f"VAE loaded: dtype={vae_dtype}, device={device}")
 
         # Load CLIP/text encoder to GPU via ComfyUI's model management (one-time cost)
-        clip.load_model()
+        # Can't use clip.load_model() with empty tokens — ACE-Step 1.5's
+        # memory_estimation_function expects tokenized input with lm_metadata.
+        # Call load_models_gpu directly on the patcher instead.
+        if model_management:
+            model_management.load_models_gpu([clip.patcher])
         logger.info("CLIP/text encoder loaded")
 
         # Get condition encoder and move to GPU
